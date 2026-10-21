@@ -8,6 +8,7 @@ import { MuseHost, MuseHostError } from "../muse/host.js";
 import { ModelCatalog } from "../muse/models.js";
 import { BadRequestError, SessionRouter } from "../muse/sessions.js";
 import { runTurn, type MuseUsage, type MuseTurnError } from "../muse/turn.js";
+import { UsageFile } from "../muse/usage.js";
 import { type ChatMessage, digestUsers, localTitle, userMessages } from "../translate/messages.js";
 
 export const HEADER_SESSION = "x-open-muse-session";
@@ -39,6 +40,7 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
   const host = new MuseHost(config, log);
   const catalog = new ModelCatalog(host, config, log);
   const router = new SessionRouter(host, config, log);
+  const usageFile = config.usageFile ? new UsageFile(config.usageFile, host, log) : undefined;
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((error) => {
@@ -166,6 +168,7 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
       if (writer?.started) return writer.error(message, failure.kind);
       return sendError(res, failureStatus(failure), message);
     }
+    if (!failure) usageFile?.afterTurn();
     const finish = failure?.kind === "stepLimit" ? "length" : "stop";
     if (writer) return writer.finish(finish, usage, body.stream_options?.include_usage !== false);
     sendJson(res, 200, completion(responseId, created, model, content, reasoning, finish, usage));

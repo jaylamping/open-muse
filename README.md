@@ -313,10 +313,21 @@ On OpenCode 2.x:
 | `stateDir` | `OPEN_MUSE_STATE_DIR` | see below | Where the session map and model cache are kept |
 | `debug` | `OPEN_MUSE_DEBUG` | `false` | Log proxy and `muse serve` activity to stderr |
 | `traceFile` | `OPEN_MUSE_TRACE_FILE` | unset | Append every protocol notification from `muse serve` to this file (JSON lines) |
+| `usageFile` | `OPEN_MUSE_USAGE_FILE` | see below | Where to write your plan usage as JSON. `false` (or `off` in the env var) turns it off. |
 | `museEnv` | — | `{}` | Extra environment variables for `muse serve`, e.g. to point it at a different config dir |
 
 State directory default: `%LOCALAPPDATA%\open-muse` on Windows, `$XDG_DATA_HOME/open-muse`
 (or `~/.local/share/open-muse`) elsewhere.
+
+Plan usage file: whenever `muse serve` reports your plan usage, open-muse writes it to
+`$XDG_STATE_HOME/open-muse/usage.json` (`~/.local/state/open-muse/usage.json` by default,
+`%LOCALAPPDATA%\open-muse\usage.json` on Windows), so a status bar widget or a script can show
+how much of the plan is left. The numbers are Muse's own, as of `observedAtMs`, and fields Muse
+doesn't send are left out. It holds no tokens or account details:
+
+```json
+{"tier":"...","window":{"usedPercent":12,"windowDurationMins":300,"resetsAtMs":1767225600000},"weekly":{"usedPercent":3,"resetsAtMs":1767657600000},"observedAtMs":1767207600000,"writtenAtMs":1767207600123}
+```
 
 To customise model metadata on OpenCode 1.x, add a regular `provider.muse` block; it's merged
 over what the plugin registers:
@@ -432,6 +443,7 @@ src/
 │   ├── host.ts            Supervises one `muse serve` child (spawn, handshake, respawn),
 │   │                      notification fan-out, binary resolution
 │   ├── sessions.ts        OpenCode session → Muse session mapping, history diffing, persistence
+│   ├── usage.ts           Plan usage (usage/changed, usage/read) to the usage file
 │   ├── turn.ts            Runs one turn: turn/start → item/* events → turn/completed,
 │   │                      auto-approval, cancellation
 │   └── models.ts          model/list catalog, cache, OpenCode model entries and variants

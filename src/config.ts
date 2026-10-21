@@ -29,6 +29,8 @@ export interface OpenMuseConfig {
   debug: boolean;
   /** Append every protocol notification from `muse serve` to this file (JSON lines), for troubleshooting. */
   traceFile?: string;
+  /** Write the plan usage Muse reports to this JSON file, for status bars. Unset turns it off. */
+  usageFile?: string;
 }
 
 function envFlag(name: string, fallback: boolean): boolean {
@@ -46,6 +48,23 @@ function defaultStateDir(): string {
     return path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "open-muse");
   }
   return path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "open-muse");
+}
+
+function defaultUsageFile(): string {
+  const base =
+    process.platform === "win32"
+      ? process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local")
+      : process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+  return path.join(base, "open-muse", "usage.json");
+}
+
+/** `usageFile`: a path, or false to turn it off. `OPEN_MUSE_USAGE_FILE`: a path, or 0/false/no/off. */
+function usageFile(option: unknown): string | undefined {
+  if (option === false) return undefined;
+  if (typeof option === "string" && option !== "") return option;
+  const raw = process.env.OPEN_MUSE_USAGE_FILE;
+  if (raw == null || raw === "") return defaultUsageFile();
+  return /^(0|false|no|off)$/i.test(raw) ? undefined : raw;
 }
 
 /** Plugin options (from `["open-muse", { ... }]` in opencode.json) win over env vars, which win over defaults. */
@@ -70,6 +89,7 @@ export function resolveConfig(options: Record<string, unknown> = {}): OpenMuseCo
     stateDir: String(options.stateDir ?? env.OPEN_MUSE_STATE_DIR ?? defaultStateDir()),
     debug: typeof options.debug === "boolean" ? options.debug : envFlag("OPEN_MUSE_DEBUG", false),
     traceFile: typeof options.traceFile === "string" ? options.traceFile : env.OPEN_MUSE_TRACE_FILE || undefined,
+    usageFile: usageFile(options.usageFile),
   };
 }
 

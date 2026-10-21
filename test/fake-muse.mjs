@@ -15,6 +15,12 @@ const pendingCancels = new Map(); // turnId -> resolve()
 const send = (frame) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...frame }) + "\n");
 const notify = (method, params) => send({ method, params: { ...params, viewCursor: nextCursor() } });
 const range = { start: cursor, end: cursor };
+const PLAN_USAGE = {
+  tier: "fake-plan",
+  window: { usedPercent: 12, windowDurationMins: 300, resetsAtMs: 1_900_000_000_000 },
+  weekly: { usedPercent: 3, resetsAtMs: 1_900_500_000_000 },
+  observedAtMs: 1_800_000_000_000,
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function log(entry) {
@@ -48,6 +54,8 @@ async function handle({ id, method, params = {} }) {
           userAgent: "fake-muse/1.4.6",
         },
       });
+    case "usage/read":
+      return send({ id, result: { usage: PLAN_USAGE } });
     case "model/list":
       return send({
         id,
@@ -164,6 +172,8 @@ async function runScript(sessionId, turnId, params) {
   ]) {
     notify("session/tokenUsage", { ...base, turnId, modelId: sessions.get(sessionId)?.modelId, usage, promptTokens: usage.inputTokens, totalTokens: usage.inputTokens + usage.outputTokens, sourceRange: range, cumulative: {} });
   }
+  // Like muse 1.4: plan usage is pushed when it changes (outside the view stream, so no viewCursor).
+  send({ method: "usage/changed", params: PLAN_USAGE });
   notify("turn/foregroundCompleted", { ...base, turnId, blockingAgents: ["reviewer"], sourceRange: range });
   notify("turn/completed", { ...base, turnId, terminal: "completed", sourceRange: range });
 }

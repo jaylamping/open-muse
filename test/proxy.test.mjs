@@ -12,6 +12,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-test-"));
 const logFile = path.join(tmp, "requests.jsonl");
 process.env.FAKE_MUSE_LOG = logFile;
+const usageFile = path.join(tmp, "state", "usage.json");
+process.env.OPEN_MUSE_USAGE_FILE = usageFile;
 
 const config = (extra = {}) =>
   resolveConfig({ museBin: process.execPath, museArgsPrefix: [path.join(here, "fake-muse.mjs")], port: 0, stateDir: tmp, ...extra });
@@ -87,6 +89,38 @@ test("streams a turn: text, reasoning, usage", async () => {
   assert.ok(!out.reasoning.includes("Reminder"), "background reviewer items are not traced");
   assert.ok(out.done);
   assert.ok(!out.content.includes("OpenCode tools"), "system prompt is not forwarded by default");
+});
+
+test("writes plan usage to the usage file", async () => {
+  await collect(await chat({ messages: [{ role: "user", content: "usage please" }] }, session("s-usage")));
+  for (let i = 0; i < 50 && count("usage/read") === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(count("usage/read"), 1, "asks once after the first finished turn");
+  const written = JSON.parse(fs.readFileSync(usageFile, "utf8"));
+  assert.ok(written.writtenAtMs > 0);
+  delete written.writtenAtMs;
+  assert.deepEqual(written, {
+    tier: "fake-plan",
+    window: { usedPercent: 12, windowDurationMins: 300, resetsAtMs: 1_900_000_000_000 },
+    weekly: { usedPercent: 3, resetsAtMs: 1_900_500_000_000 },
+    observedAtMs: 1_800_000_000_000,
+  });
+  if (process.platform !== "win32") assert.equal(fs.statSync(usageFile).mode & 0o777, 0o644);
+  assert.deepEqual(fs.readdirSync(path.dirname(usageFile)), ["usage.json"], "no temp files left behind");
+  await collect(await chat({ messages: [{ role: "user", content: "again" }] }, session("s-usage-2")));
+  assert.equal(count("usage/read"), 1, "does not ask again on later turns");
+});
+
+test("usage file: missing fields are left out, and it can be turned off", async () => {
+  const { planUsage } = await import("../dist/muse/usage.js");
+  assert.deepEqual(planUsage({ tier: "t", window: { usedPercent: 5, extra: "x" }, secret: "no" }), { tier: "t", window: { usedPercent: 5 } });
+  assert.equal(planUsage({ tier: "t" }), undefined);
+  assert.equal(config({ usageFile: false }).usageFile, undefined);
+  process.env.OPEN_MUSE_USAGE_FILE = "off";
+  try {
+    assert.equal(resolveConfig({}).usageFile, undefined);
+  } finally {
+    process.env.OPEN_MUSE_USAGE_FILE = usageFile;
+  }
 });
 
 test("continues the same Muse session, sending only the new message", async () => {
