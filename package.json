@@ -8,7 +8,8 @@
   "exports": {
     ".": "./dist/plugin.js",
     "./server": "./server.js",
-    "./proxy": "./dist/proxy/server.js"
+    "./proxy": "./dist/proxy/server.js",
+    "./tui": "./tui.tsx"
   },
   "bin": {
     "open-muse": "dist/cli.js"
@@ -16,6 +17,7 @@
   "files": [
     "dist",
     "server.js",
+    "tui.tsx",
     "README.md",
     "LICENSE"
   ],
@@ -37,7 +39,9 @@
     "opencode-plugin"
   ],
   "dependencies": {
-    "@muse-code/sdk": "1.4.6"
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@muse-code/sdk": "1.4.6",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.30",
