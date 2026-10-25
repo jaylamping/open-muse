@@ -160,8 +160,10 @@ opencode models | grep '^muse/'     # OpenCode 2.x
 ```
 
 `doctor` shows which `muse` binary it found, starts `muse serve`, lists the models your
-account can use, runs one tiny turn in an empty temp folder to confirm you're signed in (a few
-tokens of quota; skip it with `--no-turn`), and on Windows checks the sandbox. The `models` command should print entries like
+account can use with each model's default effort in standard vs contributor mode, runs one
+tiny turn in an empty temp folder to confirm you're signed in (a few tokens of quota; skip
+it with `--no-turn`), then shows the subscription quota (5h window and weekly percent),
+and on Windows checks the sandbox. The `models` command should print entries like
 `muse/muse-wonder-1.0`.
 
 Restart OpenCode after installing or upgrading.
@@ -192,7 +194,10 @@ opencode run --standalone -m 'muse/muse-wonder-1.0#xhigh' "Find and fix the race
 ## Models and reasoning effort
 
 The model list comes from `muse serve` (`model/list`) for your account and is cached in the
-open-muse state directory (refreshed at most daily). Until the first refresh these defaults
+open-muse state directory. It refreshes automatically: in the background when OpenCode
+starts (if the cache is older than a day), on `GET /v1/models` when the cache is stale,
+and on every `open-muse doctor` run. A model that appears tomorrow is therefore picked
+up without a restart or code change. Until the first refresh these defaults
 are listed:
 
 | Model | Context | Notes |
@@ -202,8 +207,19 @@ are listed:
 | `muse/muse-spark-1.3` | ~1M | |
 | `muse/muse-spark-1.2` | ~1M | |
 
-What you actually get depends on your plan; whatever `model/list` returns (including
-contributor-mode variants, if offered) shows up automatically after the first refresh.
+What you actually get depends on your plan; whatever `model/list` returns shows up
+automatically after the next refresh. Every listed model also appears as a
+`-contributor` twin (same context, output, and reasoning efforts; never the
+default), so a future `muse-new-1.0` is immediately usable as `muse-new-1.0-contributor`
+— this mirrors Muse Code, which itself runs in contributor mode by default.
+Server-listed `-contributor` entries are always kept as-is and never duplicated.
+Set `contributor: false` to list the server catalog as-is instead.
+
+Choosing a model also chooses its mode: `-contributor` models run on a host
+spawned with `muse serve --contributor-mode on`, standard models on a host
+spawned with `--contributor-mode off`. Switching modes mid-conversation starts
+a fresh Muse session seeded with the transcript (like edited history), while a
+same-mode model change reuses the session via `session/setModel`.
 
 Each model gets OpenCode **variants** for the reasoning tiers Muse reports (typically
 `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Choosing a variant sends `reasoning_effort`, which open-muse passes
@@ -306,6 +322,7 @@ On OpenCode 2.x:
 | `approvals` | `OPEN_MUSE_APPROVALS` | `allow` | `allow`, `deny`, or `host` ([details](#approvals)) |
 | `toolDisplay` | `OPEN_MUSE_TOOL_DISPLAY` | `reasoning` | Where tool traces go: `reasoning`, `content`, or `hidden` |
 | `localTitles` | `OPEN_MUSE_LOCAL_TITLES` | `true` | Answer session-title requests locally |
+| `contributor` | `OPEN_MUSE_CONTRIBUTOR` | `true` | `-contributor` models run with `--contributor-mode on`, standard models with `off`; each model gains a `-contributor` twin unless the server lists one (`false`: legacy single host, no flag, server catalog as-is) |
 | `forwardSystemPrompt` | `OPEN_MUSE_FORWARD_SYSTEM` | `false` | Send OpenCode's system prompt to Muse when a session starts. Off by default because it describes OpenCode's tools, which Muse doesn't have. |
 | `providerId` | `OPEN_MUSE_PROVIDER_ID` | `muse` | Provider id in OpenCode (`<id>/<model>`) |
 | `port` | `OPEN_MUSE_PORT` | random | Proxy port |
@@ -351,6 +368,7 @@ npx open-muse serve --port 4517
 
 - Base URL: `http://127.0.0.1:4517/v1`, any API key
 - `GET /v1/models`, `POST /v1/chat/completions` (streaming and non-streaming)
+- `GET /v1/usage`: subscription quota (`window` 5h percent and reset, `weekly` percent and reset, `tier`); `data` is `null` until the host observed a turn
 - Optional headers:
   - `x-open-muse-session`: conversation id (otherwise one is derived from the first message)
   - `x-open-muse-directory`: project directory Muse should work in (otherwise the proxy's cwd)
@@ -448,6 +466,7 @@ How Muse events are mapped:
 | `item/started` / `item/completed` on a `toolCall` | `▸ tool: args` / `↳ tool done` trace lines |
 | `approval/requested` | answered with `approval/decide` by policy, plus a trace line |
 | `turn/completed` (`usage`) | final chunk with `finish_reason` and `usage` |
+| `session/tokenUsage` (× N calls) | one `prompt_tokens` per turn: the peak call's input (each call re-sends the context, so summing would count it N times); outputs stay summed |
 | `turn/completed` (`failed`) | HTTP 401/429/502, or an SSE `error` chunk mid-stream |
 
 `item/completed` is treated as authoritative, so text that missed a delta is still delivered.

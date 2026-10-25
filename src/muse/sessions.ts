@@ -11,6 +11,7 @@ import {
   toTurnInput,
   userMessages,
 } from "../translate/messages.js";
+import { isContributorModel } from "./models.js";
 
 interface Mapping {
   museSessionId: string;
@@ -34,6 +35,8 @@ export interface PrepareRequest {
 
 export interface PreparedTurn {
   museSessionId: string;
+  /** The host owning this Muse session: turns must run against it. */
+  host: MuseHost;
   input: TurnInputPart[];
   /** Record that Muse accepted this turn's message, so the next request sends only what's new. */
   commit(): void;
@@ -52,15 +55,15 @@ const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
  * a rendering of the earlier conversation.
  */
 export class SessionRouter {
-  #host: MuseHost;
+  #hostFor: (modelId: string | undefined) => MuseHost;
   #config: OpenMuseConfig;
   #log: Logger;
   #file: string;
   #mappings = new Map<string, Mapping>();
   #locks = new Map<string, Promise<void>>();
 
-  constructor(host: MuseHost, config: OpenMuseConfig, log: Logger) {
-    this.#host = host;
+  constructor(hostFor: (modelId: string | undefined) => MuseHost, config: OpenMuseConfig, log: Logger) {
+    this.#hostFor = hostFor;
     this.#config = config;
     this.#log = log;
     this.#file = path.join(config.stateDir, "sessions.json");
@@ -96,11 +99,17 @@ export class SessionRouter {
       this.#save();
     };
 
-    if (mapping && mapping.workspace === request.workspace && this.#continues(mapping, users)) {
+    if (
+      mapping &&
+      mapping.workspace === request.workspace &&
+      this.#continues(mapping, users) &&
+      sameMode(mapping.modelId, request.modelId)
+    ) {
       const ready = await this.#reattach(mapping, request.modelId);
       if (ready) {
+        const host = this.#hostFor(mapping.modelId);
         this.#log.debug("continuing muse session", mapping.museSessionId);
-        return { museSessionId: mapping.museSessionId, input: toTurnInput(last), commit: once(commitFor(mapping.museSessionId)) };
+        return { museSessionId: mapping.museSessionId, host, input: toTurnInput(last), commit: once(commitFor(mapping.museSessionId)) };
       }
     }
 
@@ -114,9 +123,10 @@ export class SessionRouter {
     const history = renderHistory(request.messages.slice(0, lastIndex));
     if (history) prefix.push(history);
 
-    const museSessionId = await this.#start(request.workspace, request.modelId);
+    const host = this.#hostFor(request.modelId);
+    const museSessionId = await this.#start(host, request.workspace, request.modelId);
     this.#log.debug("started muse session", museSessionId, mapping ? "(history diverged)" : "");
-    return { museSessionId, input: toTurnInput(last, prefix.join("\n\n")), commit: once(commitFor(museSessionId)) };
+    return { museSessionId, host, input: toTurnInput(last, prefix.join("\n\n")), commit: once(commitFor(museSessionId)) };
   }
 
   /** True when the request is the conversation Muse has, plus exactly one new user message (or a retry of the last). */
@@ -128,13 +138,14 @@ export class SessionRouter {
 
   async #reattach(mapping: Mapping, modelId: string | undefined): Promise<boolean> {
     const id = mapping.museSessionId;
+    const host = this.#hostFor(mapping.modelId);
     try {
-      if (!this.#host.isLoaded(id)) {
-        await this.#host.command("session/resume", { sessionId: id, excludeItems: true });
-        this.#host.markLoaded(id);
+      if (!host.isLoaded(id)) {
+        await host.command("session/resume", { sessionId: id, excludeItems: true });
+        host.markLoaded(id);
       }
       if (modelId && modelId !== mapping.modelId) {
-        await this.#host.command("session/setModel", { sessionId: id, model: { modelId } });
+        await host.command("session/setModel", { sessionId: id, model: { modelId } });
       }
       return true;
     } catch (error) {
@@ -143,13 +154,13 @@ export class SessionRouter {
     }
   }
 
-  async #start(workspace: string, modelId: string | undefined): Promise<string> {
+  async #start(host: MuseHost, workspace: string, modelId: string | undefined): Promise<string> {
     const params: Record<string, unknown> = { workspaceRoot: workspace };
     if (modelId) params.modelId = modelId;
-    const result = await this.#host.command("session/start", params);
+    const result = await host.command("session/start", params);
     const session = result.session as { sessionId?: string } | undefined;
     if (!session?.sessionId) throw new Error("muse serve did not return a session id");
-    this.#host.markLoaded(session.sessionId);
+    host.markLoaded(session.sessionId);
     return session.sessionId;
   }
 
@@ -191,6 +202,12 @@ export class SessionRouter {
 }
 
 export class BadRequestError extends Error {}
+
+/** A Muse session cannot move between hosts: switching the contributor mode
+ * starts a fresh session seeded with the transcript, like edited history. */
+function sameMode(a: string | undefined, b: string | undefined): boolean {
+  return isContributorModel(a) === isContributorModel(b);
+}
 
 function once(fn: () => void): () => void {
   let done = false;

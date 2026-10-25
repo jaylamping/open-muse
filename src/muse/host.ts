@@ -24,15 +24,19 @@ const VERSION = "0.1.0";
 export class MuseHost {
   #config: OpenMuseConfig;
   #log: Logger;
+  /** Explicit `--contributor-mode` for this host. Undefined keeps the legacy
+   * behavior: the flag is passed only when the `contributor` option is on. */
+  #contributorMode: "on" | "off" | undefined;
   #spawned: Promise<SpawnedMspConnection> | undefined;
   #listeners = new Set<Listener>();
   #loaded = new Set<string>();
   #stderrTail: string[] = [];
   #closing = false;
 
-  constructor(config: OpenMuseConfig, log: Logger) {
+  constructor(config: OpenMuseConfig, log: Logger, contributorMode?: "on" | "off") {
     this.#config = config;
     this.#log = log;
+    this.#contributorMode = contributorMode;
   }
 
   /** Subscribe to every notification the host pushes. Returns the unsubscribe function. */
@@ -81,7 +85,13 @@ export class MuseHost {
     // Node can't spawn .cmd/.bat shims directly on Windows; route them through cmd.exe.
     const viaCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(resolved);
     const command = viaCmd ? process.env.ComSpec ?? "cmd.exe" : resolved;
-    const args = [...(viaCmd ? ["/d", "/s", "/c", resolved] : []), ...this.#config.museArgsPrefix, "serve"];
+    const mode = this.#contributorMode ?? (this.#config.contributor ? "on" : undefined);
+    const args = [
+      ...(viaCmd ? ["/d", "/s", "/c", resolved] : []),
+      ...this.#config.museArgsPrefix,
+      "serve",
+      ...(mode === undefined ? [] : ["--contributor-mode", mode]),
+    ];
     this.#log.debug("spawning", command, args.join(" "));
     this.#stderrTail = [];
     const handshake = spawnMspConnection({

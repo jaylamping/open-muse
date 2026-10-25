@@ -25,6 +25,15 @@ export interface OpenMuseConfig {
   forwardSystemPrompt: boolean;
   /** Answer OpenCode's session-title requests locally instead of spending a Muse prompt on them. */
   localTitles: boolean;
+  /**
+   * Picking a `-contributor` model runs it on a host spawned with
+   * `muse serve --contributor-mode on`; standard models run with `off`
+   * (Muse Code's own default is on, hence the default here). Every listed
+   * model gains a derived `-contributor` twin unless the server lists one.
+   * Set to `false` for the legacy single host (no flag) and the server
+   * catalog as-is.
+   */
+  contributor: boolean;
   stateDir: string;
   debug: boolean;
   /** Append every protocol notification from `muse serve` to this file (JSON lines), for troubleshooting. */
@@ -67,6 +76,7 @@ export function resolveConfig(options: Record<string, unknown> = {}): OpenMuseCo
     forwardSystemPrompt:
       typeof options.forwardSystemPrompt === "boolean" ? options.forwardSystemPrompt : envFlag("OPEN_MUSE_FORWARD_SYSTEM", false),
     localTitles: typeof options.localTitles === "boolean" ? options.localTitles : envFlag("OPEN_MUSE_LOCAL_TITLES", true),
+    contributor: typeof options.contributor === "boolean" ? options.contributor : envFlag("OPEN_MUSE_CONTRIBUTOR", true),
     stateDir: String(options.stateDir ?? env.OPEN_MUSE_STATE_DIR ?? defaultStateDir()),
     debug: typeof options.debug === "boolean" ? options.debug : envFlag("OPEN_MUSE_DEBUG", false),
     traceFile: typeof options.traceFile === "string" ? options.traceFile : env.OPEN_MUSE_TRACE_FILE || undefined,

@@ -5,7 +5,8 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { createLogger, type OpenMuseConfig, type Logger, type ApprovalPolicy } from "../config.js";
 import { MuseHost, MuseHostError } from "../muse/host.js";
-import { ModelCatalog } from "../muse/models.js";
+import { ModelCatalog, isContributorModel, resolveEffort } from "../muse/models.js";
+import { readUsage } from "../muse/usage.js";
 import { BadRequestError, SessionRouter } from "../muse/sessions.js";
 import { runTurn, type MuseUsage, type MuseTurnError } from "../muse/turn.js";
 import { type ChatMessage, digestUsers, localTitle, userMessages } from "../translate/messages.js";
@@ -36,9 +37,17 @@ export interface ProxyServer {
 }
 
 export async function startProxy(config: OpenMuseConfig, log: Logger = createLogger(config)): Promise<ProxyServer> {
-  const host = new MuseHost(config, log);
-  const catalog = new ModelCatalog(host, config, log);
-  const router = new SessionRouter(host, config, log);
+  // One host per contributor mode: `-contributor` models run with
+  // `--contributor-mode on`, standard models with `off`. Each host spawns
+  // lazily, so the unused one costs nothing. With `contributor: false` both
+  // keep the legacy behavior (no flag, server list as-is, single mode).
+  const dual = config.contributor;
+  const standardHost = new MuseHost(config, log, dual ? "off" : undefined);
+  const contributorHost = new MuseHost(config, log, dual ? "on" : undefined);
+  const hostFor = (modelId: string | undefined): MuseHost =>
+    dual && isContributorModel(modelId) ? contributorHost : standardHost;
+  const catalog = new ModelCatalog(standardHost, config, log, dual ? contributorHost : undefined);
+  const router = new SessionRouter(hostFor, config, log);
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((error) => {
@@ -54,7 +63,14 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     if (req.method === "GET" && (route === "" || route === "/health")) {
       return sendJson(res, 200, { ok: true, name: "open-muse" });
     }
+    if (req.method === "GET" && route === "/v1/usage") {
+      // Subscription quota (5h window, weekly): cheap to read, no turn spent.
+      return sendJson(res, 200, { object: "subscription_usage", data: await readUsage(standardHost, log) });
+    }
     if (req.method === "GET" && route === "/v1/models") {
+      // Refresh a day-old cache on demand, so a model that appears tomorrow
+      // shows up without restarting. Never fails the listing.
+      await catalog.refreshIfStale();
       return sendJson(res, 200, {
         object: "list",
         data: catalog.models.map((m) => ({ id: m.id, object: "model", owned_by: "muse", created: 0 })),
@@ -67,6 +83,9 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
   }
 
   async function chatCompletions(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Refresh a day-old cache so the echoed effort (and any new model) is
+    // current even when the first interaction is a chat, not a listing.
+    await catalog.refreshIfStale();
     let body: ChatRequestBody;
     try {
       body = JSON.parse(await readBody(req)) as ChatRequestBody;
@@ -75,6 +94,11 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     }
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const modelId = normalizeModel(body.model, config.providerId);
+    // Echo back what served this turn (streaming and non-streaming alike),
+    // since the real Muse reply never names its own model or effort.
+    if (modelId) res.setHeader("x-open-muse-model", modelId);
+    res.setHeader("x-open-muse-mode", isContributorModel(modelId) ? "contributor" : "standard");
+    res.setHeader("x-open-muse-reasoning-effort", resolveEffort(catalog.models, modelId, body.reasoning_effort));
     const agent = header(req, HEADER_AGENT);
     const workspace = resolveWorkspace(header(req, HEADER_DIRECTORY));
     const key = header(req, HEADER_SESSION) ?? `anon:${workspace}:${digestUsers(userMessages(messages).slice(0, 1))}`;
@@ -114,7 +138,7 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     const writer = stream ? new SseWriter(res, responseId, created, model) : undefined;
 
     try {
-      for await (const event of runTurn(host, {
+      for await (const event of runTurn(prepared.host, {
         sessionId: prepared.museSessionId,
         input: prepared.input,
         reasoningEffort: body.reasoning_effort,
@@ -181,12 +205,13 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
   return {
     url: `http://${config.host}:${port}/v1`,
     port,
-    host,
+    host: standardHost,
     catalog,
     async close() {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       server.closeAllConnections?.();
-      await host.close();
+      await standardHost.close();
+      await contributorHost.close();
     },
   };
 }
