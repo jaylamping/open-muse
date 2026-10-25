@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { MuseHost, resolveBinary } from "./muse/host.js";
 import { ModelCatalog } from "./muse/models.js";
+import { readUsage } from "./muse/usage.js";
 import { runTurn } from "./muse/turn.js";
 import { startProxy } from "./proxy/server.js";
 
@@ -43,8 +44,13 @@ async function doctor(args: string[]): Promise<number> {
     console.log(`✓ ${models.length} model(s) available:`);
     for (const m of models) console.log(`  - ${config.providerId}/${m.id}${m.isDefault ? " (default)" : ""}`);
 
+    await showModeDefaults(config, log);
+
     if (args.includes("--no-turn")) console.log("· sign-in not checked (--no-turn)");
     else ok = (await checkSignIn(host, config, log)) && ok;
+
+    // After the test turn so the host observed usage when signed in.
+    await showSubscriptionUsage(host, log);
 
     if (process.platform === "win32") ok = checkWindowsSandbox(config.museBin) && ok;
   } catch (error) {
@@ -55,6 +61,59 @@ async function doctor(args: string[]): Promise<number> {
   }
   if (ok) console.log('\nReady. In OpenCode, pick a "muse/..." model (e.g. /models).');
   return ok ? 0 : 1;
+}
+
+/**
+ * Show each model's default effort with contributor mode off vs on. A difference
+ * proves the mode is meaningful for that model; identical values prove nothing
+ * either way. Informational only: never fails the doctor run.
+ */
+async function showModeDefaults(config: ReturnType<typeof resolveConfig>, log: ReturnType<typeof createLogger>): Promise<void> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-doctor-modes-"));
+  const hosts: MuseHost[] = [];
+  try {
+    const list = async (mode: "on" | "off"): Promise<Map<string, string>> => {
+      const host = new MuseHost({ ...config, contributor: false }, log, mode);
+      hosts.push(host);
+      // Raw server list (no twins): compare what each mode really reports.
+      const catalog = new ModelCatalog(host, { ...config, stateDir: dir, contributor: false }, log);
+      const models = await catalog.refresh();
+      return new Map(models.map((m) => [m.id, m.defaultEffort ?? "?"]));
+    };
+    const [off, on] = await Promise.all([list("off"), list("on")]);
+    const ids = [...new Set([...off.keys(), ...on.keys()])].sort();
+    if (ids.length === 0) return;
+    console.log("  default effort per mode (standard | contributor):");
+    for (const id of ids) {
+      const a = off.get(id) ?? "?";
+      const b = on.get(id) ?? "?";
+      console.log(`    - ${id}: ${a} | ${b}${a !== b ? "  * differs" : ""}`);
+    }
+  } catch (error) {
+    log.debug("mode comparison skipped:", error instanceof Error ? error.message : error);
+  } finally {
+    await Promise.all(hosts.map((h) => h.close().catch(() => undefined)));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Show the subscription quota (5h window, weekly) when the host observed it. */
+async function showSubscriptionUsage(host: MuseHost, log: ReturnType<typeof createLogger>): Promise<void> {
+  const data = await readUsage(host, log);
+  if (!data) {
+    console.log("  subscription usage: not observed yet (run a turn first)");
+    return;
+  }
+  /** Local `YYYY-MM-DD HH:MM`: doctor output faces the user, and bare UTC misleads. */
+  const at = (ms: number): string => {
+    const d = new Date(ms);
+    const p = (n: number): string => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} local`;
+  };
+  console.log(
+    `  subscription usage: window ${data.window.usedPercent}% (resets ${at(data.window.resetsAtMs)}), ` +
+      `weekly ${data.weekly.usedPercent}% (resets ${at(data.weekly.resetsAtMs)})`,
+  );
 }
 
 /**

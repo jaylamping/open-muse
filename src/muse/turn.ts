@@ -214,16 +214,17 @@ export async function* runTurn(host: MuseHost, options: RunTurnOptions): AsyncGe
         }
         case "session/tokenUsage": {
           // One per model call; muse 1.4 doesn't put the aggregate on turn/completed.
+          // Every call re-sends the context so far, so summing inputs counts the
+          // shared prefix once per call. Report the peak call's input as the
+          // context this turn was actually holding, and sum what was generated.
           if (p.turnId !== turnId || !p.usage) break;
           const u = normalizeUsage(p.usage);
-          usage = usage
-            ? {
-                inputTokens: usage.inputTokens + u.inputTokens,
-                outputTokens: usage.outputTokens + u.outputTokens,
-                cachedTokens: usage.cachedTokens + u.cachedTokens,
-                reasoningTokens: usage.reasoningTokens + u.reasoningTokens,
-              }
-            : u;
+          usage = {
+            inputTokens: Math.max(usage?.inputTokens ?? 0, u.inputTokens),
+            outputTokens: (usage?.outputTokens ?? 0) + u.outputTokens,
+            cachedTokens: u.inputTokens >= (usage?.inputTokens ?? 0) ? u.cachedTokens : (usage?.cachedTokens ?? 0),
+            reasoningTokens: (usage?.reasoningTokens ?? 0) + u.reasoningTokens,
+          };
           break;
         }
         case "turn/completed": {

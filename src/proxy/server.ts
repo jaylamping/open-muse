@@ -5,8 +5,11 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { createLogger, type OpenMuseConfig, type Logger, type ApprovalPolicy } from "../config.js";
 import { MuseHost, MuseHostError } from "../muse/host.js";
-import { ModelCatalog } from "../muse/models.js";
+import { ModelCatalog, isContributorModel, resolveEffort } from "../muse/models.js";
+import { pickUsage, readUsage } from "../muse/usage.js";
 import { BadRequestError, SessionRouter } from "../muse/sessions.js";
+import { createMcpHandler } from "./mcp.js";
+import { createToolExecutor, type ToolExecutor } from "../opencode/tools.js";
 import { runTurn, type MuseUsage, type MuseTurnError } from "../muse/turn.js";
 import { type ChatMessage, digestUsers, localTitle, userMessages } from "../translate/messages.js";
 
@@ -35,10 +38,27 @@ export interface ProxyServer {
   close(): Promise<void>;
 }
 
-export async function startProxy(config: OpenMuseConfig, log: Logger = createLogger(config)): Promise<ProxyServer> {
-  const host = new MuseHost(config, log);
-  const catalog = new ModelCatalog(host, config, log);
-  const router = new SessionRouter(host, config, log);
+export async function startProxy(
+  config: OpenMuseConfig,
+  log: Logger = createLogger(config),
+  toolExecutor?: ToolExecutor,
+): Promise<ProxyServer> {
+  // One host per contributor mode: `-contributor` models run with
+  // `--contributor-mode on`, standard models with `off`. Each host spawns
+  // lazily, so the unused one costs nothing. With `contributor: false` both
+  // keep the legacy behavior (no flag, server list as-is, single mode).
+  const dual = config.contributor;
+  // The local read-only executor needs no OpenCode client; tests inject a stub.
+  const bridge = config.tools ? (toolExecutor ?? createToolExecutor()) : undefined;
+  const mcpCaps = bridge ? ["sessionMcp"] : undefined;
+  const standardHost = new MuseHost(config, log, dual ? "off" : undefined, mcpCaps);
+  const contributorHost = new MuseHost(config, log, dual ? "on" : undefined, mcpCaps);
+  const hostFor = (modelId: string | undefined): MuseHost =>
+    dual && isContributorModel(modelId) ? contributorHost : standardHost;
+  const catalog = new ModelCatalog(standardHost, config, log, dual ? contributorHost : undefined);
+  // Assigned after listen: the router and the MCP endpoint need the proxy URL.
+  let router!: SessionRouter;
+  let mcpHandler: ((req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>) | undefined;
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((error) => {
@@ -54,7 +74,19 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     if (req.method === "GET" && (route === "" || route === "/health")) {
       return sendJson(res, 200, { ok: true, name: "open-muse" });
     }
+    if (req.method === "GET" && route === "/v1/usage") {
+      // Subscription quota (5h window, weekly): cheap to read, no turn spent.
+      // Each host only observes the turns it served, so merge both modes.
+      const [standard, contributor] = await Promise.all([
+        readUsage(standardHost, log),
+        dual ? readUsage(contributorHost, log) : Promise.resolve(null),
+      ]);
+      return sendJson(res, 200, { object: "subscription_usage", data: pickUsage(standard, contributor) });
+    }
     if (req.method === "GET" && route === "/v1/models") {
+      // Refresh a day-old cache on demand, so a model that appears tomorrow
+      // shows up without restarting. Never fails the listing.
+      await catalog.refreshIfStale();
       return sendJson(res, 200, {
         object: "list",
         data: catalog.models.map((m) => ({ id: m.id, object: "model", owned_by: "muse", created: 0 })),
@@ -63,10 +95,16 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     if (req.method === "POST" && route === "/v1/chat/completions") {
       return chatCompletions(req, res);
     }
+    if (mcpHandler && (route === "/mcp" || route.startsWith("/mcp/"))) {
+      return mcpHandler(req, res);
+    }
     sendError(res, 404, `No route for ${req.method} ${url.pathname}`);
   }
 
   async function chatCompletions(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Refresh a day-old cache so the echoed effort (and any new model) is
+    // current even when the first interaction is a chat, not a listing.
+    await catalog.refreshIfStale();
     let body: ChatRequestBody;
     try {
       body = JSON.parse(await readBody(req)) as ChatRequestBody;
@@ -75,6 +113,11 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     }
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const modelId = normalizeModel(body.model, config.providerId);
+    // Echo back what served this turn (streaming and non-streaming alike),
+    // since the real Muse reply never names its own model or effort.
+    if (modelId) res.setHeader("x-open-muse-model", modelId);
+    res.setHeader("x-open-muse-mode", isContributorModel(modelId) ? "contributor" : "standard");
+    res.setHeader("x-open-muse-reasoning-effort", resolveEffort(catalog.models, modelId, body.reasoning_effort));
     const agent = header(req, HEADER_AGENT);
     const workspace = resolveWorkspace(header(req, HEADER_DIRECTORY));
     const key = header(req, HEADER_SESSION) ?? `anon:${workspace}:${digestUsers(userMessages(messages).slice(0, 1))}`;
@@ -114,7 +157,7 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     const writer = stream ? new SseWriter(res, responseId, created, model) : undefined;
 
     try {
-      for await (const event of runTurn(host, {
+      for await (const event of runTurn(prepared.host, {
         sessionId: prepared.museSessionId,
         input: prepared.input,
         reasoningEffort: body.reasoning_effort,
@@ -176,17 +219,35 @@ export async function startProxy(config: OpenMuseConfig, log: Logger = createLog
     server.listen(config.port, config.host, () => resolve());
   });
   const port = (server.address() as AddressInfo).port;
-  log.debug(`proxy listening on http://${config.host}:${port}/v1`);
+  const origin = `http://${config.host}:${port}`;
+  const url = `${origin}/v1`;
+  log.debug(`proxy listening on ${url}`);
+  // The TUI quota footer reads this to find the proxy without any manual config.
+  try {
+    fs.mkdirSync(config.stateDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(config.stateDir, "proxy.json"),
+      JSON.stringify({ url, origin, port, pid: process.pid, startedAtMs: Date.now() }),
+    );
+  } catch (error) {
+    log.debug("proxy.json skipped:", error instanceof Error ? error.message : error);
+  }
+  router = new SessionRouter(hostFor, config, log, bridge ? { baseUrl: origin } : undefined);
+  if (bridge) {
+    const execute = bridge;
+    mcpHandler = createMcpHandler(execute, (key) => router.workspaceFor(key), log);
+  }
 
   return {
-    url: `http://${config.host}:${port}/v1`,
+    url,
     port,
-    host,
+    host: standardHost,
     catalog,
     async close() {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       server.closeAllConnections?.();
-      await host.close();
+      await standardHost.close();
+      await contributorHost.close();
     },
   };
 }

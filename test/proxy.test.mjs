@@ -73,6 +73,256 @@ test("lists models", async () => {
   assert.ok(body.data.some((m) => m.id === "muse-spark-1.3"));
 });
 
+test("contributor option keeps server-listed variants without duplicating them", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-contrib-"));
+  const contributed = await startProxy(config({ contributor: true, stateDir: dir }));
+  try {
+    // The server lists both entries here, so no twin is derived.
+    await contributed.catalog.refresh();
+    const ids = contributed.catalog.models.map((m) => m.id);
+    assert.deepEqual(ids, ["muse-spark-1.3", "muse-spark-1.3-contributor"]);
+    const res = await fetch(`${contributed.url}/models`);
+    assert.equal(res.status, 200);
+    assert.deepEqual(
+      (await res.json()).data.map((m) => m.id),
+      ids,
+    );
+  } finally {
+    await contributed.close();
+  }
+});
+
+test("contributor refresh derives a -contributor twin for each new base model", async () => {
+  const { ModelCatalog, displayName } = await import("../dist/muse/models.js");
+  const { createLogger } = await import("../dist/config.js");
+  // A future server lists only the base id: the twin is derived, limits and
+  // efforts are copied, and the default flag is never inherited.
+  const stubHost = {
+    request: async () => ({
+      models: [
+        { modelId: "muse-new-9.0", displayLabel: "Muse New 9.0", contextLimit: 42, outputLimit: 7, variants: ["low", "high"], isDefault: true, defaultReasoningEffort: "max" },
+      ],
+    }),
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-twin-"));
+  const cfg = config({ contributor: true, stateDir: dir });
+  const catalog = new ModelCatalog(stubHost, cfg, createLogger(cfg));
+  const models = await catalog.refresh();
+  assert.deepEqual(
+    models.map((m) => m.id),
+    ["muse-new-9.0", "muse-new-9.0-contributor"],
+  );
+  const twin = models[1];
+  assert.equal(twin.context, 42);
+  assert.equal(twin.output, 7);
+  assert.deepEqual(twin.efforts, ["low", "high"]);
+  assert.equal(twin.isDefault, false);
+  assert.equal(displayName(twin), "Muse New 9.0 Contributor");
+  assert.equal(twin.defaultEffort, "max");
+  // Persisted, so the twin survives restarts without another refresh.
+  const cached = JSON.parse(fs.readFileSync(path.join(dir, "models.json"), "utf8"));
+  assert.deepEqual(
+    cached.map((m) => m.id),
+    ["muse-new-9.0", "muse-new-9.0-contributor"],
+  );
+});
+
+test("model display names are friendly labels, ids stay raw", async () => {
+  const { displayName, prettyModelName } = await import("../dist/muse/models.js");
+  assert.equal(prettyModelName("muse-wonder-1.0"), "Muse Wonder");
+  assert.equal(prettyModelName("muse-wonder-1.0-contributor"), "Muse Wonder Contributor");
+  assert.equal(prettyModelName("muse-spark-1.0"), "Muse Spark");
+  assert.equal(prettyModelName("muse-spark-1.3"), "Muse Spark 1.3");
+  assert.equal(prettyModelName("muse-spark-1.3-contributor"), "Muse Spark 1.3 Contributor");
+  assert.equal(prettyModelName("muse-spark-1.2-contributor"), "Muse Spark 1.2 Contributor");
+  assert.equal(prettyModelName("something-else"), "something-else");
+  // A server-provided label is kept with the id visible, so base and
+  // contributor variants can't be confused.
+  assert.equal(displayName({ id: "muse-spark-1.3", name: "Muse Spark 1.3" }), "Muse Spark 1.3 (muse-spark-1.3)");
+  assert.equal(displayName({ id: "muse-spark-1.3", name: "muse-spark-1.3" }), "Muse Spark 1.3");
+});
+
+test("old cached twins are migrated to the friendly label", async () => {
+  const { ModelCatalog, displayName } = await import("../dist/muse/models.js");
+  const { createLogger } = await import("../dist/config.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-migrate-"));
+  // Cache as written before twins were named by their own id.
+  fs.writeFileSync(
+    path.join(dir, "models.json"),
+    JSON.stringify([
+      { id: "muse-spark-1.3", name: "muse-spark-1.3", context: 1, output: 1, efforts: ["low"] },
+      { id: "muse-spark-1.3-contributor", name: "muse-spark-1.3", context: 1, output: 1, efforts: ["low"] },
+    ]),
+  );
+  const cfg = config({ contributor: true, stateDir: dir });
+  const stubHost = { request: async () => { throw new Error("cache is fresh, must not refresh"); } };
+  const catalog = new ModelCatalog(stubHost, cfg, createLogger(cfg));
+  assert.deepEqual(
+    catalog.models.map((m) => displayName(m)),
+    ["Muse Spark 1.3", "Muse Spark 1.3 Contributor"],
+  );
+});
+
+test("standard and contributor models run on their own host", async () => {
+  const { SessionRouter } = await import("../dist/muse/sessions.js");
+  const { createLogger } = await import("../dist/config.js");
+  const { isContributorModel } = await import("../dist/muse/models.js");
+  const calls = [];
+  const stubHost = (name) => ({
+    command: async (method, params) => {
+      calls.push({ host: name, method, model: params.modelId ?? params.model?.modelId });
+      if (method === "session/start") return { session: { sessionId: `${name}-sess` } };
+      if (method === "session/resume") return { session: { sessionId: params.sessionId } };
+      if (method === "session/setModel") return { status: "accepted" };
+      throw new Error(`unexpected ${method}`);
+    },
+    isLoaded: () => true,
+    markLoaded: () => {},
+  });
+  const standard = stubHost("standard");
+  const contributor = stubHost("contributor");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-routing-"));
+  const cfg = config({ stateDir: dir });
+  const router = new SessionRouter(
+    (modelId) => (isContributorModel(modelId) ? contributor : standard),
+    cfg,
+    createLogger(cfg),
+  );
+  const history = [];
+  const chat = async (modelId, text, reply = "ok") => {
+    if (history.length > 0) history.push({ role: "assistant", content: reply });
+    history.push({ role: "user", content: text });
+    const prepared = await router.prepare({ key: "s-route", workspace: tmp, messages: [...history], modelId });
+    prepared.commit();
+    prepared.release();
+    return prepared;
+  };
+
+  // Standard model starts on the standard host.
+  let p = await chat("muse-spark-1.3", "first");
+  assert.equal(p.host, standard);
+  assert.equal(p.museSessionId, "standard-sess");
+
+  // Same conversation, contributor twin: history continues but the mode
+  // differs, so a fresh session starts on the contributor host.
+  p = await chat("muse-spark-1.3-contributor", "second");
+  assert.equal(p.host, contributor);
+  assert.equal(p.museSessionId, "contributor-sess");
+  assert.ok(calls.some((c) => c.host === "contributor" && c.method === "session/start"));
+
+  // Same-mode model change reuses the session via setModel on the same host.
+  const starts = calls.filter((c) => c.method === "session/start").length;
+  p = await chat("muse-spark-1.2-contributor", "third");
+  assert.equal(p.host, contributor);
+  assert.equal(p.museSessionId, "contributor-sess");
+  assert.equal(calls.filter((c) => c.method === "session/start").length, starts);
+  assert.ok(calls.some((c) => c.host === "contributor" && c.method === "session/setModel" && c.model === "muse-spark-1.2-contributor"));
+});
+
+test("twin defaults come from the contributor host", async () => {
+  const { ModelCatalog, resolveEffort } = await import("../dist/muse/models.js");
+  const { createLogger } = await import("../dist/config.js");
+  const row = (defaultReasoningEffort) => ({
+    models: [
+      { modelId: "muse-spark-1.3", displayLabel: "muse-spark-1.3", contextLimit: 1, outputLimit: 1, variants: ["low", "max"], isDefault: true, defaultReasoningEffort },
+    ],
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-dual-defaults-"));
+  const cfg = config({ contributor: true, stateDir: dir });
+  const catalog = new ModelCatalog(
+    { request: async () => row("high") },
+    cfg,
+    createLogger(cfg),
+    { request: async () => row("max") },
+  );
+  const models = await catalog.refresh();
+  const byId = Object.fromEntries(models.map((m) => [m.id, m]));
+  assert.equal(byId["muse-spark-1.3"].defaultEffort, "high");
+  assert.equal(byId["muse-spark-1.3-contributor"].defaultEffort, "max");
+  assert.equal(resolveEffort(models, "muse-spark-1.3"), "high");
+  assert.equal(resolveEffort(models, "muse-spark-1.3-contributor"), "max");
+});
+
+test("resolveEffort returns the real effort a turn will run with", async () => {
+  const { resolveEffort } = await import("../dist/muse/models.js");
+  const models = [
+    { id: "muse-spark-1.3", name: "Muse Spark 1.3", context: 1, output: 1, efforts: ["low", "max"], defaultEffort: "max" },
+  ];
+  assert.equal(resolveEffort(models, "muse-spark-1.3", "low"), "low");
+  assert.equal(resolveEffort(models, "muse-spark-1.3"), "max");
+  assert.equal(resolveEffort(models, "muse-unknown-9.9"), "default");
+  assert.equal(resolveEffort(models, undefined), "default");
+});
+
+test("without contributor mode no twin is derived", async () => {
+  const { ModelCatalog } = await import("../dist/muse/models.js");
+  const { createLogger } = await import("../dist/config.js");
+  const stubHost = {
+    request: async () => ({
+      models: [{ modelId: "muse-new-9.0", displayLabel: "M", contextLimit: 1, outputLimit: 1, variants: ["low"], isDefault: false }],
+    }),
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-notwin-"));
+  const cfg = config({ contributor: false, stateDir: dir });
+  const catalog = new ModelCatalog(stubHost, cfg, createLogger(cfg));
+  assert.deepEqual((await catalog.refresh()).map((m) => m.id), ["muse-new-9.0"]);
+});
+
+test("contributor twins are on by default, even before the first refresh", async () => {
+  const { ModelCatalog, DEFAULT_MODELS } = await import("../dist/muse/models.js");
+  const { createLogger, resolveConfig } = await import("../dist/config.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-default-"));
+  const cfg = resolveConfig({ stateDir: dir });
+  assert.equal(cfg.contributor, true);
+  // Any server call here would be a bug: the twins come from the defaults.
+  const stubHost = { request: async () => { throw new Error("must not refresh"); } };
+  const catalog = new ModelCatalog(stubHost, cfg, createLogger(cfg));
+  assert.deepEqual(
+    catalog.models.map((m) => m.id),
+    [...DEFAULT_MODELS.map((m) => m.id), ...DEFAULT_MODELS.map((m) => `${m.id}-contributor`)].sort(),
+  );
+});
+
+test("catalog is alphabetical, each model next to its contributor twin", async () => {
+  const { ModelCatalog } = await import("../dist/muse/models.js");
+  const { createLogger } = await import("../dist/config.js");
+  const stubHost = {
+    request: async () => ({
+      models: [
+        { modelId: "muse-wonder-1.0", displayLabel: "muse-wonder-1.0", contextLimit: 1, outputLimit: 1, variants: ["low"], isDefault: true },
+        { modelId: "muse-spark-1.2", displayLabel: "muse-spark-1.2", contextLimit: 1, outputLimit: 1, variants: ["low"], isDefault: false },
+      ],
+    }),
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-sorted-"));
+  const cfg = config({ contributor: true, stateDir: dir });
+  const catalog = new ModelCatalog(stubHost, cfg, createLogger(cfg));
+  assert.deepEqual((await catalog.refresh()).map((m) => m.id), [
+    "muse-spark-1.2",
+    "muse-spark-1.2-contributor",
+    "muse-wonder-1.0",
+    "muse-wonder-1.0-contributor",
+  ]);
+});
+
+test("GET /v1/models refreshes a day-old cache so new models appear", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-stale-"));
+  const cacheFile = path.join(dir, "models.json");
+  fs.writeFileSync(cacheFile, JSON.stringify([{ id: "muse-old-1.0", name: "old", context: 1, output: 1, efforts: ["low"] }]));
+  const past = new Date(Date.now() - 25 * 3600 * 1000);
+  fs.utimesSync(cacheFile, past, past);
+  const staleProxy = await startProxy(config({ stateDir: dir }));
+  try {
+    const res = await fetch(`${staleProxy.url}/models`);
+    assert.equal(res.status, 200);
+    const ids = (await res.json()).data.map((m) => m.id);
+    assert.ok(!ids.includes("muse-old-1.0"), "stale cache was replaced");
+    assert.ok(ids.includes("muse-spark-1.3"), "fresh server list is served");
+  } finally {
+    await staleProxy.close();
+  }
+});
+
 test("streams a turn: text, reasoning, usage", async () => {
   const res = await chat({ messages: [{ role: "system", content: "OpenCode tools..." }, { role: "user", content: "hello" }] }, session("s-basic"));
   assert.equal(res.status, 200);
@@ -81,9 +331,9 @@ test("streams a turn: text, reasoning, usage", async () => {
   assert.equal(out.content, "Muse heard: hello [images=0] [model=muse-spark-1.3] [effort=default]");
   assert.equal(out.reasoning, "Thinking about the request.");
   assert.equal(out.finish, "stop");
-  assert.equal(out.usage.prompt_tokens, 120);
+  assert.equal(out.usage.prompt_tokens, 70);
   assert.equal(out.usage.completion_tokens, 30);
-  assert.equal(out.usage.prompt_tokens_details.cached_tokens, 20);
+  assert.equal(out.usage.prompt_tokens_details.cached_tokens, 0);
   assert.ok(!out.reasoning.includes("Reminder"), "background reviewer items are not traced");
   assert.ok(out.done);
   assert.ok(!out.content.includes("OpenCode tools"), "system prompt is not forwarded by default");
@@ -168,6 +418,179 @@ test("client disconnect cancels the Muse turn", async () => {
   assert.ok(count("turn/cancel") >= 1);
 });
 
+test("responses echo the serving model, mode and effort in headers", async () => {
+  const res = await chat(
+    { stream: false, model: "muse/muse-spark-1.3-contributor", reasoning_effort: "high", messages: [{ role: "user", content: "hi" }] },
+    session("s-headers"),
+  );
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("x-open-muse-model"), "muse-spark-1.3-contributor");
+  assert.equal(res.headers.get("x-open-muse-mode"), "contributor");
+  assert.equal(res.headers.get("x-open-muse-reasoning-effort"), "high");
+  const res2 = await chat({ stream: false, messages: [{ role: "user", content: "hi" }] }, session("s-headers-std"));
+  assert.equal(res2.headers.get("x-open-muse-mode"), "standard");
+  // The fake server reports high as this model's default effort.
+  assert.equal(res2.headers.get("x-open-muse-reasoning-effort"), "high");
+});
+
+test("bridged tools stay in the project and refuse secrets", async () => {
+  const { createToolExecutor } = await import("../dist/opencode/tools.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-tools-"));
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "src", "a.ts"), "hello\n".repeat(5));
+  fs.writeFileSync(path.join(dir, ".env"), "KEY=sekret\n");
+  const run = createToolExecutor();
+  const log = { debug: () => {}, warn: () => {} };
+  const at = (tool, args) => run({ tool, args, directory: dir }, log);
+  assert.equal(await at("read", { path: "src/a.ts" }), "hello\n".repeat(5));
+  assert.match(await at("grep", { pattern: "hello" }), /src\/a\.ts:1: hello/);
+  assert.match(await at("glob", { query: "src/*.ts" }), /src\/a\.ts/);
+  await assert.rejects(at("write", {}), /unknown tool/);
+  await assert.rejects(at("read", {}), /path/);
+  await assert.rejects(at("read", { path: ".env" }), /sensitive/);
+  await assert.rejects(at("read", { path: "../outside" }), /escapes/);
+  await assert.rejects(at("read", { path: "missing.txt" }), /not a file/);
+  await assert.rejects(at("grep", {}), /pattern/);
+  await assert.rejects(at("grep", { pattern: "([" }), /invalid regex/);
+  await assert.rejects(at("glob", {}), /query/);
+});
+
+test("MCP endpoint lists tools and executes them per conversation", async () => {
+  const seen = [];
+  const executor = async ({ tool, args, directory }) => {
+    seen.push({ tool, args, directory });
+    if (tool === "read" && args.path === "boom") throw new Error("kaboom");
+    return `${tool}:${args.path ?? args.pattern ?? args.query}@${directory}`;
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-mcp-"));
+  const mcpProxy = await startProxy(config({ stateDir: dir, tools: true }), undefined, executor);
+  const mcpBase = mcpProxy.url.replace(/\/v1$/, "");
+  try {
+    // The MCP transport answers with server-sent events; unwrap the data frame.
+    const rpc = async (method, params, key = "s-mcp") => {
+      const res = await fetch(`${mcpBase}/mcp/${key}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      const text = await res.text();
+      const frames = text.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)));
+      assert.ok(frames.length >= 1, `expected SSE data frame, got: ${text.slice(0, 200)}`);
+      return frames.at(-1);
+    };
+    // tools/list works before any turn ran for the key.
+    const listed = await rpc("tools/list", {});
+    assert.deepEqual(
+      listed.result.tools.map((t) => t.name).sort(),
+      ["glob", "grep", "read"],
+    );
+    // tools/call on an unknown conversation fails as an MCP error, not HTTP.
+    const unknown = await rpc("tools/call", { name: "read", arguments: { path: "a" } }, "nope");
+    assert.equal(unknown.result.isError, true);
+    assert.match(unknown.result.content[0].text, /unknown conversation/);
+    // Run one chat so the conversation key maps to a workspace, then call.
+    await collect(await chat({ messages: [{ role: "user", content: "hi" }] }, session("s-mcp"), mcpProxy.url));
+    const called = await rpc("tools/call", { name: "read", arguments: { path: "a.ts" } });
+    assert.equal(called.result.isError, undefined);
+    assert.match(called.result.content[0].text, /^read:a\.ts@/);
+    assert.equal(seen.at(-1).directory, tmp);
+    const failing = await rpc("tools/call", { name: "read", arguments: { path: "boom" } });
+    assert.equal(failing.result.isError, true);
+    assert.match(failing.result.content[0].text, /kaboom/);
+    // Wrong verb and missing key are plain HTTP errors.
+    assert.equal((await fetch(`${mcpBase}/mcp/s-mcp`, { method: "GET" })).status, 405);
+    assert.equal((await fetch(`${mcpBase}/mcp/`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 404);
+  } finally {
+    await mcpProxy.close();
+  }
+});
+
+test("session/start advertises the MCP tools only when enabled", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-mcp-flag-"));
+  const stub = async () => "ok";
+  const on = await startProxy(config({ stateDir: dir, tools: true }), undefined, stub);
+  try {
+    const beforeOn = count("session/start");
+    await collect(await chat({ messages: [{ role: "user", content: "hi" }] }, session("s-mcp-on"), on.url));
+    const starts = requests().filter((r) => r.method === "session/start").slice(beforeOn);
+    assert.equal(starts.length, 1);
+    const last = starts.at(-1);
+    assert.match(last.params.config.mcpServers["open-muse-tools"].url, /\/mcp\/s-mcp-on$/);
+    assert.equal(last.params.config.mcpServers["open-muse-tools"].transport, "streamableHttp");
+  } finally {
+    await on.close();
+  }
+  const off = await startProxy(config({ stateDir: fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-mcp-off-")) }));
+  try {
+    const before = count("session/start");
+    await collect(await chat({ messages: [{ role: "user", content: "hi" }] }, session("s-mcp-off"), off.url));
+    const starts = requests().filter((r) => r.method === "session/start").slice(before);
+    assert.ok(starts.length >= 1);
+    assert.ok(starts.every((r) => r.params.config === undefined));
+    assert.equal((await fetch(`${off.url.replace(/\/v1$/, "")}/mcp/s-mcp-off`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 404);
+  } finally {
+    await off.close();
+  }
+});
+
+test("GET /v1/usage returns the subscription quota", async () => {
+  const res = await fetch(`${proxy.url}/usage`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.object, "subscription_usage");
+  assert.equal(body.data.window.usedPercent, 16);
+  assert.equal(body.data.weekly.usedPercent, 46);
+  assert.equal(body.data.window.windowDurationMins, 300);
+});
+
+test("proxy advertises its URL for the TUI quota footer", async () => {
+  const raw = fs.readFileSync(path.join(tmp, "proxy.json"), "utf8");
+  const info = JSON.parse(raw);
+  assert.equal(info.url, proxy.url);
+  assert.equal(info.port, proxy.port);
+  assert.equal(info.origin, proxy.url.replace(/\/v1$/, ""));
+  assert.equal(typeof info.pid, "number");
+});
+
+test("usage merges both hosts, freshest observation wins", async () => {
+  const { pickUsage } = await import("../dist/muse/usage.js");
+  const older = { observedAtMs: 1, tier: "t", weekly: { resetsAtMs: 1, usedPercent: 40 }, window: { resetsAtMs: 1, usedPercent: 10 } };
+  const newer = { observedAtMs: 2, tier: "t", weekly: { resetsAtMs: 1, usedPercent: 46 }, window: { resetsAtMs: 1, usedPercent: 16 } };
+  assert.equal(pickUsage(null, null), null);
+  assert.equal(pickUsage(newer, null), newer);
+  assert.equal(pickUsage(null, newer), newer);
+  assert.equal(pickUsage(older, newer), newer);
+  assert.equal(pickUsage(newer, older), newer);
+});
+
+test("readUsage returns null when the host observed nothing", async () => {
+  const { readUsage } = await import("../dist/muse/usage.js");
+  const { createLogger } = await import("../dist/config.js");
+  const log = createLogger({ debug: false });
+  assert.equal(await readUsage({ request: async () => ({}) }, log), null);
+  assert.equal(await readUsage({ request: async () => { throw new Error("down"); } }, log), null);
+  assert.equal(
+    await readUsage({ request: async () => ({ usage: { weekly: {}, window: {} } }) }, log),
+    null,
+  );
+});
+
+test("a chat refreshes a stale catalog so the echoed effort is real", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-muse-fresh-effort-"));
+  const freshProxy = await startProxy(config({ stateDir: dir }));
+  try {
+    const res = await chat(
+      { stream: false, model: "muse/muse-spark-1.3", messages: [{ role: "user", content: "hi" }] },
+      session("s-fresh-effort"),
+      freshProxy.url,
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-open-muse-reasoning-effort"), "high");
+  } finally {
+    await freshProxy.close();
+  }
+});
+
 test("non-streaming responses, model selection and reasoning effort", async () => {
   const res = await chat(
     { stream: false, model: "muse/muse-spark-1.3-contributor", reasoning_effort: "high", messages: [{ role: "user", content: "hi" }] },
@@ -180,13 +603,23 @@ test("non-streaming responses, model selection and reasoning effort", async () =
   assert.equal(body.choices[0].message.reasoning_content, "Thinking about the request.");
 });
 
-test("switching models mid-conversation calls session/setModel", async () => {
+test("switching contributor modes starts a fresh session, same-mode switches reuse it", async () => {
   const history = [{ role: "user", content: "one" }];
-  let out = await collect(await chat({ messages: history }, session("s-model")));
+  const starts = count("session/start");
+  const sets = count("session/setModel");
+  let out = await collect(await chat({ messages: history }, session("s-modes")));
   history.push({ role: "assistant", content: out.content }, { role: "user", content: "two" });
-  out = await collect(await chat({ model: "muse/muse-spark-1.3-contributor", messages: history }, session("s-model")));
+  // Standard -> contributor: a fresh session on the contributor host, no setModel.
+  out = await collect(await chat({ model: "muse/muse-spark-1.3-contributor", messages: history }, session("s-modes")));
   assert.match(out.content, /model=muse-spark-1.3-contributor/);
-  assert.ok(count("session/setModel") >= 1);
+  assert.equal(count("session/start") - starts, 2);
+  assert.equal(count("session/setModel") - sets, 0);
+  history.push({ role: "assistant", content: out.content }, { role: "user", content: "three" });
+  // Contributor -> contributor: the session is reused via setModel.
+  out = await collect(await chat({ model: "muse/muse-spark-1.2-contributor", messages: history }, session("s-modes")));
+  assert.match(out.content, /model=muse-spark-1.2-contributor/);
+  assert.equal(count("session/start") - starts, 2);
+  assert.ok(count("session/setModel") - sets >= 1);
 });
 
 test("images are forwarded as Muse image parts", async () => {

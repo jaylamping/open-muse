@@ -24,15 +24,22 @@ const VERSION = "0.1.0";
 export class MuseHost {
   #config: OpenMuseConfig;
   #log: Logger;
+  /** Explicit `--contributor-mode` for this host. Undefined keeps the legacy
+   * behavior: the flag is passed only when the `contributor` option is on. */
+  #contributorMode: "on" | "off" | undefined;
+  /** Extra grantable capabilities requested at handshake (e.g. `sessionMcp`). */
+  #capabilities: string[] | undefined;
   #spawned: Promise<SpawnedMspConnection> | undefined;
   #listeners = new Set<Listener>();
   #loaded = new Set<string>();
   #stderrTail: string[] = [];
   #closing = false;
 
-  constructor(config: OpenMuseConfig, log: Logger) {
+  constructor(config: OpenMuseConfig, log: Logger, contributorMode?: "on" | "off", capabilities?: string[]) {
     this.#config = config;
     this.#log = log;
+    this.#contributorMode = contributorMode;
+    this.#capabilities = capabilities;
   }
 
   /** Subscribe to every notification the host pushes. Returns the unsubscribe function. */
@@ -81,7 +88,13 @@ export class MuseHost {
     // Node can't spawn .cmd/.bat shims directly on Windows; route them through cmd.exe.
     const viaCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(resolved);
     const command = viaCmd ? process.env.ComSpec ?? "cmd.exe" : resolved;
-    const args = [...(viaCmd ? ["/d", "/s", "/c", resolved] : []), ...this.#config.museArgsPrefix, "serve"];
+    const mode = this.#contributorMode ?? (this.#config.contributor ? "on" : undefined);
+    const args = [
+      ...(viaCmd ? ["/d", "/s", "/c", resolved] : []),
+      ...this.#config.museArgsPrefix,
+      "serve",
+      ...(mode === undefined ? [] : ["--contributor-mode", mode]),
+    ];
     this.#log.debug("spawning", command, args.join(" "));
     this.#stderrTail = [];
     const handshake = spawnMspConnection({
@@ -106,7 +119,10 @@ export class MuseHost {
     try {
       spawned = await handshake.initialize({
         clientInfo: { name: "open_muse", title: "open-muse (OpenCode bridge)", version: VERSION },
-        capabilities: { userInputDialogs: false },
+        capabilities: {
+          userInputDialogs: false,
+          ...(this.#capabilities?.length ? { requestedCapabilities: this.#capabilities } : {}),
+        },
       });
     } catch (error) {
       throw new MuseHostError(describeSpawnFailure(museBin, error, this.#stderrTail), { cause: error });

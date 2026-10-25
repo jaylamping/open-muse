@@ -48,6 +48,18 @@ async function handle({ id, method, params = {} }) {
           userAgent: "fake-muse/1.4.6",
         },
       });
+    case "usage/read":
+      return send({
+        id,
+        result: {
+          usage: {
+            observedAtMs: 1,
+            tier: "fake-tier",
+            weekly: { resetsAtMs: 2, usedPercent: 46 },
+            window: { resetsAtMs: 3, usedPercent: 16, windowDurationMins: 300 },
+          },
+        },
+      });
     case "model/list":
       return send({
         id,
@@ -56,8 +68,8 @@ async function handle({ id, method, params = {} }) {
           profileId: null,
           source: "fake",
           models: [
-            { modelId: "muse-spark-1.3", displayLabel: "Muse Spark 1.3", contextLimit: 1048576, outputLimit: 131072, isDefault: true, isActive: false, variants: ["low", "medium", "high"], cost: null, description: null, profileId: null, providerId: "meta", releaseDate: null },
-            { modelId: "muse-spark-1.3-contributor", displayLabel: "Muse Spark 1.3 (contributor)", contextLimit: 1048576, outputLimit: 131072, isDefault: false, isActive: false, variants: ["low", "medium", "high"], cost: null, description: null, profileId: null, providerId: "meta", releaseDate: null },
+            { modelId: "muse-spark-1.3", displayLabel: "Muse Spark 1.3", contextLimit: 1048576, outputLimit: 131072, isDefault: true, isActive: false, variants: ["low", "medium", "high"], defaultReasoningEffort: "high", cost: null, description: null, profileId: null, providerId: "meta", releaseDate: null },
+            { modelId: "muse-spark-1.3-contributor", displayLabel: "Muse Spark 1.3 (contributor)", contextLimit: 1048576, outputLimit: 131072, isDefault: false, isActive: false, variants: ["low", "medium", "high"], defaultReasoningEffort: "high", cost: null, description: null, profileId: null, providerId: "meta", releaseDate: null },
           ],
         },
       });
